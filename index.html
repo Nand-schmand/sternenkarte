@@ -3,11 +3,14 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Sternenkarte – Version 1</title>
+  <title>Sternenkarte</title>
 
   <!-- Leaflet ist eine kostenlose Bibliothek, die uns die Landkarte liefert -->
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- SunCalc rechnet aus Ort und Uhrzeit aus, wo Sonne und Mond am Himmel stehen -->
+  <script src="https://unpkg.com/suncalc@1.9.0/suncalc.js"></script>
 
   <style>
     /* ===== AUSSEHEN (CSS) ===== */
@@ -28,6 +31,10 @@
     #status {
       font-size: 14px;
       color: #9aa6c2;
+    }
+    #himmelsinfo {
+      font-size: 15px;
+      margin-top: 6px;
     }
     #steuerung {
       display: flex;
@@ -77,6 +84,7 @@
   <header>
     <h1>✨ Sternenkarte – wo ist heute der Himmel klar?</h1>
     <div id="status">Lade Wetterdaten …</div>
+    <div id="himmelsinfo"></div>
   </header>
 
   <div id="steuerung">
@@ -176,21 +184,61 @@
       }
     }
 
-    // ---------- 4. Farbe passend zur Bewölkung ----------
-    // Wenig Wolken = grün (gut), viele Wolken = grau (schlecht)
-    function farbeFuer(bewoelkung) {
-      if (bewoelkung <= 20) return "#2ecc71";  // klar – top!
-      if (bewoelkung <= 40) return "#a3d977";  // leicht bewölkt
-      if (bewoelkung <= 60) return "#f1c40f";  // halb bewölkt
-      if (bewoelkung <= 80) return "#e67e22";  // ziemlich bewölkt
-      return "#555c6e";                        // zu – keine Sterne
+    // ---------- 4. Der Sterne-Score ----------
+    // Drei Fragen entscheiden, ob man Sterne sieht:
+    //   1. Sind Wolken im Weg?          (aus den Wetterdaten)
+    //   2. Stört der Mond?              (berechnet mit SunCalc)
+    //   3. Ist es überhaupt schon dunkel? (Sonne berechnet mit SunCalc)
+    // Jede Frage ergibt einen Faktor zwischen 0 (ganz schlecht) und 1 (perfekt).
+    // Die drei Faktoren werden multipliziert – ist einer 0, ist alles 0.
+
+    const GRAD = 180 / Math.PI;   // SunCalc rechnet im Bogenmaß, wir wollen Grad
+
+    function sterneScore(bewoelkung, breite, laenge, zeitpunkt) {
+      // 1. Wolken: 0 % Wolken -> 1,  100 % Wolken -> 0
+      const wolkenFaktor = 1 - bewoelkung / 100;
+
+      // 2. Mond: Wie hell ist er, und wie hoch steht er?
+      const mondLicht = SunCalc.getMoonIllumination(zeitpunkt).fraction;           // 0 = Neumond, 1 = Vollmond
+      const mondHoehe = SunCalc.getMoonPosition(zeitpunkt, breite, laenge).altitude * GRAD;
+      let mondFaktor = 1;
+      if (mondHoehe > 0) {
+        // Je voller und je höher (bis 30°), desto mehr stört er. Vollmond hoch oben: Faktor 0,4
+        const hoehenAnteil = Math.min(mondHoehe, 30) / 30;
+        mondFaktor = 1 - 0.6 * mondLicht * hoehenAnteil;
+      }
+
+      // 3. Dunkelheit: Erst wenn die Sonne 18° unter dem Horizont ist, ist es richtig dunkel
+      const sonnenHoehe = SunCalc.getPosition(zeitpunkt, breite, laenge).altitude * GRAD;
+      let dunkelFaktor;
+      if (sonnenHoehe <= -18) dunkelFaktor = 1;        // tiefe Nacht
+      else if (sonnenHoehe >= -6) dunkelFaktor = 0;    // noch zu hell (Dämmerung oder Tag)
+      else dunkelFaktor = (-6 - sonnenHoehe) / 12;     // dazwischen: langsam dunkler
+
+      const score = Math.round(100 * wolkenFaktor * mondFaktor * dunkelFaktor);
+      return { score, mondLicht, mondHoehe, sonnenHoehe };
     }
-    function textFuer(bewoelkung) {
-      if (bewoelkung <= 20) return "🌟 Perfekt für Sterne!";
-      if (bewoelkung <= 40) return "🙂 Ganz gut";
-      if (bewoelkung <= 60) return "😐 Mal so, mal so";
-      if (bewoelkung <= 80) return "🙁 Eher schlecht";
-      return "☁️ Keine Chance";
+
+    // Farbe passend zum Score: hoch = grün (gut), niedrig = grau (schlecht)
+    function farbeFuer(score) {
+      if (score >= 80) return "#2ecc71";  // top!
+      if (score >= 60) return "#a3d977";  // gut
+      if (score >= 40) return "#f1c40f";  // geht so
+      if (score >= 20) return "#e67e22";  // eher schlecht
+      return "#555c6e";                   // keine Chance
+    }
+    function textFuer(score) {
+      if (score >= 80) return "🌟 Perfekt für Sterne!";
+      if (score >= 60) return "🙂 Gut";
+      if (score >= 40) return "😐 Geht so";
+      if (score >= 20) return "🙁 Eher schlecht";
+      return "❌ Keine Chance";
+    }
+
+    // Passendes Mond-Symbol: phase geht von 0 (Neumond) über 0,5 (Vollmond) bis 1
+    function mondSymbol(phase) {
+      const symbole = ["🌑", "🌒", "🌓", "🌔", "🌕", "🌖", "🌗", "🌘"];
+      return symbole[Math.round(phase * 8) % 8];
     }
 
     // ---------- 5. Daten bei Open-Meteo bestellen ----------
@@ -249,11 +297,20 @@
 
     // Gibt einem Kästchen die Farbe und den Info-Text für die aktuelle Stunde
     function faerbe(k) {
-      const wert = k.daten.hourly.cloud_cover[aktuelleStunde];
-      k.rechteck.setStyle({ fillColor: farbeFuer(wert) });
+      const wolken = k.daten.hourly.cloud_cover[aktuelleStunde];
+      const zeitpunkt = new Date(zeiten[aktuelleStunde]);   // "2026-11-17T22:00" -> echte Uhrzeit
+      const h = sterneScore(wolken, k.punkt.breite, k.punkt.laenge, zeitpunkt);
+
+      k.rechteck.setStyle({ fillColor: farbeFuer(h.score) });
       k.rechteck.bindPopup(
         "<b>" + k.punkt.land + "</b><br>" +
-        "Bewölkung: " + wert + " %<br>" + textFuer(wert)
+        "Sterne-Score: <b>" + h.score + " / 100</b> – " + textFuer(h.score) + "<br>" +
+        "☁️ Bewölkung: " + wolken + " %<br>" +
+        "🌙 Mond: " + (h.mondHoehe > 0
+          ? Math.round(h.mondLicht * 100) + " % beleuchtet, " + Math.round(h.mondHoehe) + "° über dem Horizont"
+          : "untergegangen – stört nicht") + "<br>" +
+        "🌅 " + (h.sonnenHoehe <= -18 ? "Richtig dunkel"
+          : h.sonnenHoehe < -6 ? "Dämmerung" : "Noch zu hell")
       );
     }
 
@@ -263,6 +320,20 @@
       grobeKaestchen.forEach(faerbe);
       feineKaestchen.forEach(faerbe);
       document.getElementById("zeitanzeige").textContent = schoeneZeit(zeiten[stundenIndex]);
+      zeigeHimmelsinfo(new Date(zeiten[stundenIndex]));
+    }
+
+    // Die Zeile oben: Was macht der Mond gerade? (gerechnet für die Mitte Deutschlands)
+    function zeigeHimmelsinfo(zeitpunkt) {
+      const mond = SunCalc.getMoonIllumination(zeitpunkt);
+      const hoehe = SunCalc.getMoonPosition(zeitpunkt, 51.2, 10.4).altitude * GRAD;
+      const zeiten = SunCalc.getMoonTimes(zeitpunkt, 51.2, 10.4);
+      const uhr = d => d ? d.toLocaleTimeString("de-DE", { hour: "2-digit", minute: "2-digit" }) + " Uhr" : "keiner an diesem Tag";
+
+      document.getElementById("himmelsinfo").textContent =
+        mondSymbol(mond.phase) + " Mond zu " + Math.round(mond.fraction * 100) + " % beleuchtet · " +
+        (hoehe > 0 ? "steht gerade am Himmel" : "ist gerade nicht zu sehen") +
+        " · Aufgang " + uhr(zeiten.rise) + ", Untergang " + uhr(zeiten.set);
     }
 
     // Macht aus "2026-11-17T22:00" ein lesbares "Heute, 22:00 Uhr"
@@ -337,12 +408,13 @@
     legende.onAdd = function () {
       const box = L.DomUtil.create("div", "legende");
       box.innerHTML =
-        "<b>Bewölkung</b><br>" +
-        '<span style="background:#2ecc71"></span>0–20 % klar<br>' +
-        '<span style="background:#a3d977"></span>21–40 %<br>' +
-        '<span style="background:#f1c40f"></span>41–60 %<br>' +
-        '<span style="background:#e67e22"></span>61–80 %<br>' +
-        '<span style="background:#555c6e"></span>81–100 % zu';
+        "<b>Sterne-Score</b><br>" +
+        '<span style="background:#2ecc71"></span>80–100 top<br>' +
+        '<span style="background:#a3d977"></span>60–79 gut<br>' +
+        '<span style="background:#f1c40f"></span>40–59 geht so<br>' +
+        '<span style="background:#e67e22"></span>20–39 schlecht<br>' +
+        '<span style="background:#555c6e"></span>0–19 keine Chance<br>' +
+        '<small>Wolken × Mond × Dunkelheit</small>';
       return box;
     };
     legende.addTo(karte);
