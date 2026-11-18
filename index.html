@@ -348,6 +348,9 @@
           "&forecast_days=2";
 
         const antwort = await fetch(adresse);
+        if (antwort.status === 429) {
+          throw new Error("Open-Meteo-Limit erreicht (zu viele Abfragen). Die App versucht es jede Minute automatisch neu");
+        }
         if (!antwort.ok) throw new Error("Open-Meteo antwortet nicht (" + antwort.status + ")");
         const daten = await antwort.json();
         // Bei mehreren Orten kommt eine Liste zurück, bei einem Ort ein einzelnes Objekt
@@ -644,13 +647,46 @@
 
     let geladenFuerStunde = "";   // für welche Stunde wir zuletzt Daten geholt haben
 
+    // ---- Zwischenspeicher (Cache) im Browser ----
+    // Damit nicht jedes Neuladen der Seite wieder ~340 Abfragen kostet, merkt sich der Browser
+    // die Wetterdaten der aktuellen Stunde. Erst in der nächsten Stunde wird neu gefragt.
+    const CACHE_NAME = "sternenkarte-wetter-v1";
+
+    function ausCacheHolen() {
+      try {
+        const gespeichert = JSON.parse(localStorage.getItem(CACHE_NAME));
+        if (gespeichert && gespeichert.stunde === jetztAlsText() && gespeichert.anzahl === punkte.length) {
+          // Zurück ins gewohnte Format: eine Liste mit { hourly: { time, cloud_cover } }
+          return gespeichert.wolken.map(w => ({ hourly: { time: gespeichert.zeiten, cloud_cover: w } }));
+        }
+      } catch (fehler) { /* kein Cache vorhanden oder nicht erlaubt – dann eben neu laden */ }
+      return null;
+    }
+
+    function inCacheLegen(daten) {
+      try {
+        localStorage.setItem(CACHE_NAME, JSON.stringify({
+          stunde: jetztAlsText(),
+          anzahl: punkte.length,
+          zeiten: daten[0].hourly.time,                 // die Uhrzeiten nur einmal speichern
+          wolken: daten.map(d => d.hourly.cloud_cover)  // pro Ort nur die Wolken-Zahlen
+        }));
+      } catch (fehler) { /* Speichern nicht möglich – nicht schlimm */ }
+    }
+
     // Holt frische Wetterdaten und stellt Regler und Leiste auf "jetzt bis +24 h"
     async function ladeAlles() {
       const status = document.getElementById("status");
       const warAufJetzt = (aktuelleStunde === ersteStunde);   // stand der Regler auf "jetzt"?
       const alteZeit = zeiten[aktuelleStunde];
 
-      grobDaten = await ladeDaten(punkte);
+      const ausCache = ausCacheHolen();
+      if (ausCache) {
+        grobDaten = ausCache;                 // 0 Abfragen!
+      } else {
+        grobDaten = await ladeDaten(punkte);  // ~340 Abfragen
+        inCacheLegen(grobDaten);
+      }
       zeiten = grobDaten[0].hourly.time;
       feineWolken.clear();          // feine Daten sind jetzt veraltet – werden beim Zoomen neu geholt
       geladenFuerStunde = jetztAlsText();
@@ -683,16 +719,16 @@
       try {
         document.getElementById("zeitregler").addEventListener("input",
           (e) => zeigeStunde(Number(e.target.value)));
-        await ladeAlles();
-        karte.on("moveend", ladeFeineWolken);   // beim Bewegen/Zoomen: feine Wolken prüfen
 
-        // Jede Minute schauen: Hat eine neue Stunde angefangen? Dann frische Daten holen.
-        // (Nur wenn die Seite gerade sichtbar ist – das spart Abfragen.)
+        // Jede Minute schauen: Hat eine neue Stunde angefangen (oder hat das Laden nicht geklappt)?
+        // Dann frische Daten holen. Nur wenn die Seite gerade sichtbar ist – das spart Abfragen.
         setInterval(pruefeNeueStunde, 60 * 1000);
         document.addEventListener("visibilitychange", pruefeNeueStunde);
+
+        await ladeAlles();
+        karte.on("moveend", ladeFeineWolken);   // beim Bewegen/Zoomen: feine Wolken prüfen
       } catch (fehler) {
-        status.textContent = "Ups, da ging was schief: " + fehler.message +
-          " – bist du mit dem Internet verbunden?";
+        status.textContent = "Ups, da ging was schief: " + fehler.message + ".";
       }
     }
 
@@ -701,9 +737,12 @@
       if (jetztAlsText() === geladenFuerStunde) return;   // noch dieselbe Stunde
       try {
         await ladeAlles();
+        karte.off("moveend", ladeFeineWolken);   // doppelt anmelden vermeiden
+        karte.on("moveend", ladeFeineWolken);
       } catch (fehler) {
         document.getElementById("live").textContent =
           "🟠 Aktualisieren hat nicht geklappt – neuer Versuch in einer Minute.";
+        document.getElementById("status").textContent = fehler.message + ".";
       }
     }
 
